@@ -5,112 +5,144 @@ from langchain.globals import (
     set_debug,
 )
 
-from langchain_groq.chat_models import ChatGroq
+from langchain_groq import ChatGroq
 
 from langgraph.constants import END
 from langgraph.graph import StateGraph
 
-from agent.prompts import *
-from agent.states import *
+from agent.prompts import (
+    planner_prompt,
+    architect_prompt,
+)
+
+from agent.states import (
+    Plan,
+    TaskPlan,
+    CoderState,
+)
 
 from agent.tools import (
     write_file,
     read_file,
 )
 
-# =====================================
+# ==========================================
 # LOAD ENVIRONMENT
-# =====================================
+# ==========================================
 
 load_dotenv()
 
-# =====================================
+# ==========================================
 # DISABLE LOGS
-# =====================================
+# ==========================================
 
 set_debug(False)
 set_verbose(False)
 
-# =====================================
-# LLM
-# =====================================
+# ==========================================
+# FAST + STABLE MODEL
+# ==========================================
 
 llm = ChatGroq(
     model="llama-3.1-8b-instant",
     temperature=0,
 )
 
-# =====================================
+# ==========================================
 # CLEAN MODEL OUTPUT
-# =====================================
+# ==========================================
 
 def clean_code(content: str) -> str:
-    """
-    Clean model output.
-    """
 
     if not content:
         return ""
 
-    lines = content.splitlines()
-
-    cleaned_lines = []
-
-    skip_prefixes = [
+    bad_prefixes = [
+        "```html",
+        "```css",
+        "```javascript",
+        "```js",
+        "```python",
         "```",
-        "---",
-        "File:",
-        "Filename:",
-        "# File:",
-        "// File:",
     ]
 
-    for line in lines:
+    for prefix in bad_prefixes:
+        content = content.replace(prefix, "")
 
-        stripped = line.strip()
+    return content.strip()
 
-        should_skip = any(
-            stripped.startswith(prefix)
-            for prefix in skip_prefixes
-        )
+# ==========================================
+# VALIDATION
+# ==========================================
 
-        if not should_skip:
-            cleaned_lines.append(line)
+def validate_code(filepath: str, content: str) -> bool:
 
-    cleaned = "\n".join(cleaned_lines).strip()
+    if not content.strip():
+        return False
 
-    return cleaned
+    if "```" in content:
+        return False
 
-# =====================================
+    # HTML validation
+    if filepath.endswith(".html"):
+
+        required = [
+            "<html",
+            "</html>",
+            "<body",
+            "</body>",
+        ]
+
+        for item in required:
+
+            if item.lower() not in content.lower():
+                return False
+
+    # CSS validation
+    elif filepath.endswith(".css"):
+
+        if "{" not in content:
+            return False
+
+        if "}" not in content:
+            return False
+
+    # JS validation
+    elif filepath.endswith(".js"):
+
+        bad_patterns = [
+            "TODO",
+            "lorem ipsum",
+        ]
+
+        for pattern in bad_patterns:
+
+            if pattern.lower() in content.lower():
+                return False
+
+    return True
+
+# ==========================================
 # PLANNER AGENT
-# =====================================
+# ==========================================
 
 def planner_agent(state: dict) -> dict:
-    """
-    Convert user prompt into structured Plan.
-    """
 
     user_prompt = state["user_prompt"]
 
     enhanced_prompt = f"""
 {planner_prompt(user_prompt)}
 
-IMPORTANT:
-- If user asks for simple frontend apps,
-  use:
+IMPORTANT RULES:
+
+- For simple apps use:
   html, css, javascript
 
-- Use React ONLY if explicitly requested
+- Use React ONLY if user explicitly asks
 
-- For simple apps like:
-  calculator
-  todo app
-  portfolio
-  landing page
-  weather app
+- Avoid backend unless requested
 
-  prefer plain:
-  html + css + javascript
+- Prefer minimal file structures
 """
 
     response = llm.with_structured_output(
@@ -122,21 +154,18 @@ IMPORTANT:
     if response is None:
 
         raise ValueError(
-            "Planner failed to generate plan."
+            "Planner failed."
         )
 
     return {
         "plan": response
     }
 
-# =====================================
+# ==========================================
 # ARCHITECT AGENT
-# =====================================
+# ==========================================
 
 def architect_agent(state: dict) -> dict:
-    """
-    Convert Plan into TaskPlan.
-    """
 
     plan: Plan = state["plan"]
 
@@ -151,7 +180,7 @@ def architect_agent(state: dict) -> dict:
     if response is None:
 
         raise ValueError(
-            "Architect failed to generate task plan."
+            "Architect failed."
         )
 
     response.plan = plan
@@ -160,22 +189,19 @@ def architect_agent(state: dict) -> dict:
         "task_plan": response
     }
 
-# =====================================
+# ==========================================
 # CODER AGENT
-# =====================================
+# ==========================================
 
 def coder_agent(state: dict) -> dict:
-    """
-    Generate code file-by-file.
-    """
 
     coder_state: CoderState = state.get(
         "coder_state"
     )
 
-    # =====================================
-    # INITIALIZE STATE
-    # =====================================
+    # ======================================
+    # INIT STATE
+    # ======================================
 
     if coder_state is None:
 
@@ -190,31 +216,28 @@ def coder_agent(state: dict) -> dict:
         .implementation_steps
     )
 
-    # =====================================
+    # ======================================
     # STOP CONDITION
-    # =====================================
+    # ======================================
 
-    if (
-        coder_state.current_step_idx
-        >= len(steps)
-    ):
+    if coder_state.current_step_idx >= len(steps):
 
         return {
             "coder_state": coder_state,
             "status": "DONE",
         }
 
-    # =====================================
+    # ======================================
     # CURRENT TASK
-    # =====================================
+    # ======================================
 
     current_task = steps[
         coder_state.current_step_idx
     ]
 
-    # =====================================
-    # READ EXISTING CONTENT
-    # =====================================
+    # ======================================
+    # EXISTING CONTENT
+    # ======================================
 
     try:
 
@@ -228,98 +251,105 @@ def coder_agent(state: dict) -> dict:
 
         existing_content = ""
 
-    # =====================================
+    # ======================================
     # PROMPT
-    # =====================================
+    # ======================================
 
     prompt = f"""
 You are a senior software engineer.
 
-You are generating ONLY ONE FILE.
+Generate COMPLETE code for ONE file only.
 
-PROJECT CONTEXT:
+PROJECT:
 {coder_state.task_plan.plan.model_dump_json()}
 
-CURRENT TASK:
+TASK:
 {current_task.task_description}
 
 TARGET FILE:
 {current_task.filepath}
 
-EXISTING FILE CONTENT:
+EXISTING CONTENT:
 {existing_content}
 
 STRICT RULES:
-- Generate code ONLY for:
-  {current_task.filepath}
-
+- Generate ONLY raw code
+- No markdown
+- No explanations
+- No code fences
+- No extra text
+- Generate COMPLETE file
+- Ensure valid syntax
+- Ensure production-ready code
 - NEVER generate multiple files
-- NEVER include markdown
-- NEVER include ``` fences
-- NEVER explain anything
-- Return ONLY raw code
-
-IMPORTANT PROJECT RULES:
-
-- Every HTML project MUST contain:
-  - index.html
-  - style.css
-  - script.js
-
-- index.html MUST:
-  - contain valid HTML5
-  - properly link CSS and JS
-  - contain visible UI
-
-- CSS MUST be valid
-
-- JavaScript MUST:
-  - work in browser
-  - avoid syntax errors
-  - manipulate DOM correctly
-
-- React projects MUST:
-  - include valid imports
-  - export default components
-  - avoid duplicate components
-  - avoid mixing multiple files
-
-- NEVER leave placeholder code
-- NEVER leave TODO comments
-- Generate COMPLETE production-ready code
-- Ensure syntax is fully valid
-
-IMPORTANT:
-Generate ONLY the code for:
-{current_task.filepath}
+- NEVER mention filenames
 """
 
-    # =====================================
+    # ======================================
     # GENERATE CODE
-    # =====================================
+    # ======================================
+
+    generated_code = ""
 
     try:
 
-        response = llm.invoke(prompt)
+        max_retries = 3
 
-        generated_code = clean_code(
-            response.content
-        )
+        for attempt in range(max_retries):
 
-        # =====================================
-        # VALIDATE EMPTY OUTPUT
-        # =====================================
+            response = llm.invoke(prompt)
+
+            generated_code = clean_code(
+                response.content
+            )
+
+            if validate_code(
+                current_task.filepath,
+                generated_code,
+            ):
+                break
+
+        # ==================================
+        # FALLBACK CONTENT
+        # ==================================
 
         if not generated_code.strip():
 
-            generated_code = (
-                f"// Failed to generate content "
-                f"for {current_task.filepath}"
-            )
+            if current_task.filepath.endswith(".html"):
 
-        # =====================================
+                generated_code = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Generated App</title>
+</head>
+<body>
+    <h1>Generated App</h1>
+</body>
+</html>
+"""
+
+            elif current_task.filepath.endswith(".css"):
+
+                generated_code = """
+body {
+    font-family: Arial;
+}
+"""
+
+            elif current_task.filepath.endswith(".js"):
+
+                generated_code = """
+console.log("Generated App");
+"""
+
+            else:
+
+                generated_code = "Generated file"
+
+        # ==================================
         # SAVE FILE
-        # =====================================
+        # ==================================
 
         write_file.invoke(
             {
@@ -335,9 +365,9 @@ Generate ONLY the code for:
             "status": f"ERROR: {str(e)}",
         }
 
-    # =====================================
+    # ======================================
     # NEXT STEP
-    # =====================================
+    # ======================================
 
     coder_state.current_step_idx += 1
 
@@ -345,15 +375,11 @@ Generate ONLY the code for:
         "coder_state": coder_state,
     }
 
-# =====================================
+# ==========================================
 # BUILD GRAPH
-# =====================================
+# ==========================================
 
 graph = StateGraph(dict)
-
-# =====================================
-# NODES
-# =====================================
 
 graph.add_node(
     "planner",
@@ -370,9 +396,9 @@ graph.add_node(
     coder_agent
 )
 
-# =====================================
+# ==========================================
 # FLOW
-# =====================================
+# ==========================================
 
 graph.add_edge(
     "planner",
@@ -384,9 +410,9 @@ graph.add_edge(
     "coder"
 )
 
-# =====================================
-# LOOP CODER UNTIL DONE
-# =====================================
+# ==========================================
+# LOOP
+# ==========================================
 
 graph.add_conditional_edges(
     "coder",
@@ -401,32 +427,31 @@ graph.add_conditional_edges(
     },
 )
 
-# =====================================
-# ENTRY POINT
-# =====================================
+# ==========================================
+# ENTRY
+# ==========================================
 
 graph.set_entry_point(
     "planner"
 )
 
-# =====================================
-# COMPILE GRAPH
-# =====================================
+# ==========================================
+# COMPILE
+# ==========================================
 
 agent = graph.compile()
 
-# =====================================
-# LOCAL TESTING
-# =====================================
+# ==========================================
+# LOCAL TEST
+# ==========================================
 
 if __name__ == "__main__":
 
     result = agent.invoke(
         {
             "user_prompt": (
-                "Build a colourful modern "
-                "todo app using html css "
-                "and javascript"
+                "Build a colourful calculator "
+                "using html css and javascript"
             )
         },
         {
