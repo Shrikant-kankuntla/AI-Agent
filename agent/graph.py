@@ -77,7 +77,9 @@ def clean_code(content: str) -> str:
         if not should_skip:
             cleaned_lines.append(line)
 
-    return "\n".join(cleaned_lines).strip()
+    cleaned = "\n".join(cleaned_lines).strip()
+
+    return cleaned
 
 # =====================================
 # PLANNER AGENT
@@ -90,10 +92,31 @@ def planner_agent(state: dict) -> dict:
 
     user_prompt = state["user_prompt"]
 
+    enhanced_prompt = f"""
+{planner_prompt(user_prompt)}
+
+IMPORTANT:
+- If user asks for simple frontend apps,
+  use:
+  html, css, javascript
+
+- Use React ONLY if explicitly requested
+
+- For simple apps like:
+  calculator
+  todo app
+  portfolio
+  landing page
+  weather app
+
+  prefer plain:
+  html + css + javascript
+"""
+
     response = llm.with_structured_output(
         Plan
     ).invoke(
-        planner_prompt(user_prompt)
+        enhanced_prompt
     )
 
     if response is None:
@@ -227,23 +250,47 @@ EXISTING FILE CONTENT:
 {existing_content}
 
 STRICT RULES:
-- Generate code ONLY for this exact file:
+- Generate code ONLY for:
   {current_task.filepath}
 
-- NEVER generate code for other files
-- NEVER include multiple files in one response
-- NEVER include filenames in output
+- NEVER generate multiple files
 - NEVER include markdown
 - NEVER include ``` fences
 - NEVER explain anything
 - Return ONLY raw code
-- Generate COMPLETE valid code
-- Ensure imports/exports are correct
-- Ensure syntax is valid
-- Ensure production-ready code
+
+IMPORTANT PROJECT RULES:
+
+- Every HTML project MUST contain:
+  - index.html
+  - style.css
+  - script.js
+
+- index.html MUST:
+  - contain valid HTML5
+  - properly link CSS and JS
+  - contain visible UI
+
+- CSS MUST be valid
+
+- JavaScript MUST:
+  - work in browser
+  - avoid syntax errors
+  - manipulate DOM correctly
+
+- React projects MUST:
+  - include valid imports
+  - export default components
+  - avoid duplicate components
+  - avoid mixing multiple files
+
+- NEVER leave placeholder code
+- NEVER leave TODO comments
+- Generate COMPLETE production-ready code
+- Ensure syntax is fully valid
 
 IMPORTANT:
-Your response MUST contain code for ONLY:
+Generate ONLY the code for:
 {current_task.filepath}
 """
 
@@ -258,6 +305,17 @@ Your response MUST contain code for ONLY:
         generated_code = clean_code(
             response.content
         )
+
+        # =====================================
+        # VALIDATE EMPTY OUTPUT
+        # =====================================
+
+        if not generated_code.strip():
+
+            generated_code = (
+                f"// Failed to generate content "
+                f"for {current_task.filepath}"
+            )
 
         # =====================================
         # SAVE FILE
@@ -293,7 +351,10 @@ Your response MUST contain code for ONLY:
 
 graph = StateGraph(dict)
 
-# Nodes
+# =====================================
+# NODES
+# =====================================
+
 graph.add_node(
     "planner",
     planner_agent
