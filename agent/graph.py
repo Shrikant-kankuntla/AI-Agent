@@ -1,77 +1,135 @@
 from dotenv import load_dotenv
-from langchain.globals import set_verbose, set_debug
+
+from langchain.globals import (
+    set_verbose,
+    set_debug,
+)
+
 from langchain_groq.chat_models import ChatGroq
+
 from langgraph.constants import END
 from langgraph.graph import StateGraph
 
 from agent.prompts import *
 from agent.states import *
+
 from agent.tools import (
     write_file,
     read_file,
 )
 
-# =========================
-# Load environment
-# =========================
+# =====================================
+# LOAD ENVIRONMENT
+# =====================================
 
 load_dotenv()
 
-# Disable noisy logs
+# =====================================
+# DISABLE LOGS
+# =====================================
+
 set_debug(False)
 set_verbose(False)
 
-# =========================
+# =====================================
 # LLM
-# =========================
+# =====================================
 
 llm = ChatGroq(
     model="llama-3.1-8b-instant",
     temperature=0,
 )
 
-# =========================
-# Planner Agent
-# =========================
+# =====================================
+# CLEAN MODEL OUTPUT
+# =====================================
+
+def clean_code(content: str) -> str:
+    """
+    Clean model output.
+    """
+
+    if not content:
+        return ""
+
+    lines = content.splitlines()
+
+    cleaned_lines = []
+
+    skip_prefixes = [
+        "```",
+        "---",
+        "File:",
+        "Filename:",
+        "# File:",
+        "// File:",
+    ]
+
+    for line in lines:
+
+        stripped = line.strip()
+
+        should_skip = any(
+            stripped.startswith(prefix)
+            for prefix in skip_prefixes
+        )
+
+        if not should_skip:
+            cleaned_lines.append(line)
+
+    return "\n".join(cleaned_lines).strip()
+
+# =====================================
+# PLANNER AGENT
+# =====================================
 
 def planner_agent(state: dict) -> dict:
     """
-    Converts user prompt into a structured project plan.
+    Convert user prompt into structured Plan.
     """
 
     user_prompt = state["user_prompt"]
 
-    response = llm.with_structured_output(Plan).invoke(
+    response = llm.with_structured_output(
+        Plan
+    ).invoke(
         planner_prompt(user_prompt)
     )
 
     if response is None:
-        raise ValueError("Planner failed to generate plan.")
+
+        raise ValueError(
+            "Planner failed to generate plan."
+        )
 
     return {
         "plan": response
     }
 
-
-# =========================
-# Architect Agent
-# =========================
+# =====================================
+# ARCHITECT AGENT
+# =====================================
 
 def architect_agent(state: dict) -> dict:
     """
-    Converts Plan into TaskPlan.
+    Convert Plan into TaskPlan.
     """
 
     plan: Plan = state["plan"]
 
-    response = llm.with_structured_output(TaskPlan).invoke(
+    response = llm.with_structured_output(
+        TaskPlan
+    ).invoke(
         architect_prompt(
             plan=plan.model_dump_json()
         )
     )
 
     if response is None:
-        raise ValueError("Architect failed to generate task plan.")
+
+        raise ValueError(
+            "Architect failed to generate task plan."
+        )
 
     response.plan = plan
 
@@ -79,90 +137,132 @@ def architect_agent(state: dict) -> dict:
         "task_plan": response
     }
 
-
-# =========================
-# Coder Agent
-# =========================
+# =====================================
+# CODER AGENT
+# =====================================
 
 def coder_agent(state: dict) -> dict:
     """
-    Generates code file-by-file.
+    Generate code file-by-file.
     """
 
-    coder_state: CoderState = state.get("coder_state")
+    coder_state: CoderState = state.get(
+        "coder_state"
+    )
 
-    # Initialize coder state
+    # =====================================
+    # INITIALIZE STATE
+    # =====================================
+
     if coder_state is None:
+
         coder_state = CoderState(
             task_plan=state["task_plan"],
             current_step_idx=0,
         )
 
-    steps = coder_state.task_plan.implementation_steps
+    steps = (
+        coder_state
+        .task_plan
+        .implementation_steps
+    )
 
-    # =========================
-    # Stop condition
-    # =========================
+    # =====================================
+    # STOP CONDITION
+    # =====================================
 
-    if coder_state.current_step_idx >= len(steps):
+    if (
+        coder_state.current_step_idx
+        >= len(steps)
+    ):
+
         return {
             "coder_state": coder_state,
             "status": "DONE",
         }
 
-    current_task = steps[coder_state.current_step_idx]
+    # =====================================
+    # CURRENT TASK
+    # =====================================
 
-    # =========================
-    # Read existing content
-    # =========================
+    current_task = steps[
+        coder_state.current_step_idx
+    ]
+
+    # =====================================
+    # READ EXISTING CONTENT
+    # =====================================
 
     try:
+
         existing_content = read_file.invoke(
             {
                 "path": current_task.filepath
             }
         )
+
     except Exception:
+
         existing_content = ""
 
-    # =========================
-    # Prompt
-    # =========================
+    # =====================================
+    # PROMPT
+    # =====================================
 
     prompt = f"""
-You are an expert software engineer.
+You are a senior software engineer.
 
-Generate COMPLETE production-ready code.
+You are generating ONLY ONE FILE.
 
-Task:
+PROJECT CONTEXT:
+{coder_state.task_plan.plan.model_dump_json()}
+
+CURRENT TASK:
 {current_task.task_description}
 
-File Path:
+TARGET FILE:
 {current_task.filepath}
 
-Existing Content:
+EXISTING FILE CONTENT:
 {existing_content}
 
-IMPORTANT RULES:
+STRICT RULES:
+- Generate code ONLY for this exact file:
+  {current_task.filepath}
+
+- NEVER generate code for other files
+- NEVER include multiple files in one response
+- NEVER include filenames in output
+- NEVER include markdown
+- NEVER include ``` fences
+- NEVER explain anything
 - Return ONLY raw code
-- No markdown
-- No explanations
-- No code fences
-- Generate FULL file content
-- Preserve existing functionality if present
+- Generate COMPLETE valid code
+- Ensure imports/exports are correct
+- Ensure syntax is valid
+- Ensure production-ready code
+
+IMPORTANT:
+Your response MUST contain code for ONLY:
+{current_task.filepath}
 """
 
-    # =========================
-    # Generate code
-    # =========================
+    # =====================================
+    # GENERATE CODE
+    # =====================================
 
     try:
 
         response = llm.invoke(prompt)
 
-        generated_code = response.content.strip()
+        generated_code = clean_code(
+            response.content
+        )
 
-        # Save file
+        # =====================================
+        # SAVE FILE
+        # =====================================
+
         write_file.invoke(
             {
                 "path": current_task.filepath,
@@ -177,9 +277,9 @@ IMPORTANT RULES:
             "status": f"ERROR: {str(e)}",
         }
 
-    # =========================
-    # Move to next step
-    # =========================
+    # =====================================
+    # NEXT STEP
+    # =====================================
 
     coder_state.current_step_idx += 1
 
@@ -187,22 +287,46 @@ IMPORTANT RULES:
         "coder_state": coder_state,
     }
 
-
-# =========================
-# Build Graph
-# =========================
+# =====================================
+# BUILD GRAPH
+# =====================================
 
 graph = StateGraph(dict)
 
-graph.add_node("planner", planner_agent)
-graph.add_node("architect", architect_agent)
-graph.add_node("coder", coder_agent)
+# Nodes
+graph.add_node(
+    "planner",
+    planner_agent
+)
 
-# Flow
-graph.add_edge("planner", "architect")
-graph.add_edge("architect", "coder")
+graph.add_node(
+    "architect",
+    architect_agent
+)
 
-# Loop coder until done
+graph.add_node(
+    "coder",
+    coder_agent
+)
+
+# =====================================
+# FLOW
+# =====================================
+
+graph.add_edge(
+    "planner",
+    "architect"
+)
+
+graph.add_edge(
+    "architect",
+    "coder"
+)
+
+# =====================================
+# LOOP CODER UNTIL DONE
+# =====================================
+
 graph.add_conditional_edges(
     "coder",
     lambda s: (
@@ -216,23 +340,32 @@ graph.add_conditional_edges(
     },
 )
 
-# Entry point
-graph.set_entry_point("planner")
+# =====================================
+# ENTRY POINT
+# =====================================
 
-# Compile graph
+graph.set_entry_point(
+    "planner"
+)
+
+# =====================================
+# COMPILE GRAPH
+# =====================================
+
 agent = graph.compile()
 
-# =========================
-# Local Testing
-# =========================
+# =====================================
+# LOCAL TESTING
+# =====================================
 
 if __name__ == "__main__":
 
     result = agent.invoke(
         {
             "user_prompt": (
-                "Build a colourful modern todo app "
-                "using html css and javascript"
+                "Build a colourful modern "
+                "todo app using html css "
+                "and javascript"
             )
         },
         {
