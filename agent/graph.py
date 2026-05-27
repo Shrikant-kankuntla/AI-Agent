@@ -1,3 +1,5 @@
+import re
+
 from dotenv import load_dotenv
 
 from langchain.globals import (
@@ -5,21 +7,13 @@ from langchain.globals import (
     set_debug,
 )
 
-from langchain_groq import ChatGroq
+from langchain_groq.chat_models import ChatGroq
 
 from langgraph.constants import END
 from langgraph.graph import StateGraph
 
-from agent.prompts import (
-    planner_prompt,
-    architect_prompt,
-)
-
-from agent.states import (
-    Plan,
-    TaskPlan,
-    CoderState,
-)
+from agent.prompts import *
+from agent.states import *
 
 from agent.tools import (
     write_file,
@@ -27,7 +21,7 @@ from agent.tools import (
 )
 
 # ==========================================
-# LOAD ENVIRONMENT
+# LOAD ENV
 # ==========================================
 
 load_dotenv()
@@ -40,7 +34,7 @@ set_debug(False)
 set_verbose(False)
 
 # ==========================================
-# FAST + STABLE MODEL
+# LLM
 # ==========================================
 
 llm = ChatGroq(
@@ -57,25 +51,39 @@ def clean_code(content: str) -> str:
     if not content:
         return ""
 
-    bad_prefixes = [
-        "```html",
-        "```css",
-        "```javascript",
-        "```js",
-        "```python",
-        "```",
+    # remove markdown fences
+    content = re.sub(r"```[a-zA-Z]*", "", content)
+    content = content.replace("```", "")
+
+    # remove fake filenames
+    bad_lines = [
+        "File:",
+        "Filename:",
+        "# File:",
+        "// File:",
     ]
 
-    for prefix in bad_prefixes:
-        content = content.replace(prefix, "")
+    cleaned = []
 
-    return content.strip()
+    for line in content.splitlines():
+
+        stripped = line.strip()
+
+        should_skip = any(
+            stripped.startswith(x)
+            for x in bad_lines
+        )
+
+        if not should_skip:
+            cleaned.append(line)
+
+    return "\n".join(cleaned).strip()
 
 # ==========================================
 # VALIDATION
 # ==========================================
 
-def validate_code(filepath: str, content: str) -> bool:
+def validate_code(filepath: str, content: str):
 
     if not content.strip():
         return False
@@ -83,7 +91,10 @@ def validate_code(filepath: str, content: str) -> bool:
     if "```" in content:
         return False
 
-    # HTML validation
+    # ----------------------------
+    # HTML VALIDATION
+    # ----------------------------
+
     if filepath.endswith(".html"):
 
         required = [
@@ -98,8 +109,11 @@ def validate_code(filepath: str, content: str) -> bool:
             if item.lower() not in content.lower():
                 return False
 
-    # CSS validation
-    elif filepath.endswith(".css"):
+    # ----------------------------
+    # CSS VALIDATION
+    # ----------------------------
+
+    if filepath.endswith(".css"):
 
         if "{" not in content:
             return False
@@ -107,42 +121,63 @@ def validate_code(filepath: str, content: str) -> bool:
         if "}" not in content:
             return False
 
-    # JS validation
-    elif filepath.endswith(".js"):
+    # ----------------------------
+    # JS VALIDATION
+    # ----------------------------
 
-        bad_patterns = [
+    if filepath.endswith(".js"):
+
+        banned_patterns = [
+            ": string",
+            ": number",
+            ": void",
+            "interface ",
+            "type ",
+            "document.getElementById('user-input')",
+            "document.getElementById('calculate-button')",
             "TODO",
             "lorem ipsum",
         ]
 
-        for pattern in bad_patterns:
+        for pattern in banned_patterns:
 
-            if pattern.lower() in content.lower():
+            if pattern in content:
                 return False
 
     return True
 
 # ==========================================
-# PLANNER AGENT
+# PLANNER
 # ==========================================
 
-def planner_agent(state: dict) -> dict:
+def planner_agent(state: dict):
 
     user_prompt = state["user_prompt"]
 
     enhanced_prompt = f"""
 {planner_prompt(user_prompt)}
 
-IMPORTANT RULES:
+IMPORTANT:
 
-- For simple apps use:
-  html, css, javascript
+For simple apps like:
+- calculator
+- todo app
+- portfolio
+- weather app
+- landing page
 
-- Use React ONLY if user explicitly asks
+USE:
+- html
+- css
+- javascript
 
-- Avoid backend unless requested
+DO NOT use:
+- react
+- typescript
+- node
+- express
 
-- Prefer minimal file structures
+unless explicitly requested.
 """
 
     response = llm.with_structured_output(
@@ -151,23 +186,17 @@ IMPORTANT RULES:
         enhanced_prompt
     )
 
-    if response is None:
-
-        raise ValueError(
-            "Planner failed."
-        )
-
     return {
         "plan": response
     }
 
 # ==========================================
-# ARCHITECT AGENT
+# ARCHITECT
 # ==========================================
 
-def architect_agent(state: dict) -> dict:
+def architect_agent(state: dict):
 
-    plan: Plan = state["plan"]
+    plan = state["plan"]
 
     response = llm.with_structured_output(
         TaskPlan
@@ -177,12 +206,6 @@ def architect_agent(state: dict) -> dict:
         )
     )
 
-    if response is None:
-
-        raise ValueError(
-            "Architect failed."
-        )
-
     response.plan = plan
 
     return {
@@ -190,18 +213,18 @@ def architect_agent(state: dict) -> dict:
     }
 
 # ==========================================
-# CODER AGENT
+# CODER
 # ==========================================
 
-def coder_agent(state: dict) -> dict:
+def coder_agent(state: dict):
 
-    coder_state: CoderState = state.get(
+    coder_state = state.get(
         "coder_state"
     )
 
-    # ======================================
-    # INIT STATE
-    # ======================================
+    # ----------------------------
+    # INIT
+    # ----------------------------
 
     if coder_state is None:
 
@@ -216,9 +239,9 @@ def coder_agent(state: dict) -> dict:
         .implementation_steps
     )
 
-    # ======================================
-    # STOP CONDITION
-    # ======================================
+    # ----------------------------
+    # DONE
+    # ----------------------------
 
     if coder_state.current_step_idx >= len(steps):
 
@@ -227,17 +250,17 @@ def coder_agent(state: dict) -> dict:
             "status": "DONE",
         }
 
-    # ======================================
+    # ----------------------------
     # CURRENT TASK
-    # ======================================
+    # ----------------------------
 
     current_task = steps[
         coder_state.current_step_idx
     ]
 
-    # ======================================
+    # ----------------------------
     # EXISTING CONTENT
-    # ======================================
+    # ----------------------------
 
     try:
 
@@ -251,14 +274,52 @@ def coder_agent(state: dict) -> dict:
 
         existing_content = ""
 
-    # ======================================
+    # ----------------------------
+    # FILE TYPE RULES
+    # ----------------------------
+
+    extra_rules = ""
+
+    if current_task.filepath.endswith(".js"):
+
+        extra_rules = """
+JAVASCRIPT RULES:
+- Generate PURE JavaScript
+- NEVER generate TypeScript
+- NEVER use:
+  : string
+  : number
+  : void
+- NEVER use React syntax
+- MUST work directly in browser
+"""
+
+    elif current_task.filepath.endswith(".html"):
+
+        extra_rules = """
+HTML RULES:
+- Generate valid HTML5
+- Link styles.css correctly
+- Link script.js correctly
+- Include visible UI
+"""
+
+    elif current_task.filepath.endswith(".css"):
+
+        extra_rules = """
+CSS RULES:
+- Generate valid CSS
+- Add responsive styling
+"""
+
+    # ----------------------------
     # PROMPT
-    # ======================================
+    # ----------------------------
 
     prompt = f"""
-You are a senior software engineer.
+You are an expert frontend engineer.
 
-Generate COMPLETE code for ONE file only.
+Generate code for ONLY ONE FILE.
 
 PROJECT:
 {coder_state.task_plan.plan.model_dump_json()}
@@ -272,30 +333,31 @@ TARGET FILE:
 EXISTING CONTENT:
 {existing_content}
 
+{extra_rules}
+
 STRICT RULES:
-- Generate ONLY raw code
+- Output ONLY raw code
 - No markdown
 - No explanations
-- No code fences
-- No extra text
-- Generate COMPLETE file
-- Ensure valid syntax
-- Ensure production-ready code
-- NEVER generate multiple files
-- NEVER mention filenames
+- No multiple files
+- No fake filenames
+- No TODO comments
+- No placeholders
+- Generate FULL code
+- Ensure code is working
 """
 
-    # ======================================
-    # GENERATE CODE
-    # ======================================
-
-    generated_code = ""
+    # ----------------------------
+    # GENERATE
+    # ----------------------------
 
     try:
 
+        generated_code = ""
+
         max_retries = 3
 
-        for attempt in range(max_retries):
+        for _ in range(max_retries):
 
             response = llm.invoke(prompt)
 
@@ -303,53 +365,24 @@ STRICT RULES:
                 response.content
             )
 
-            if validate_code(
+            valid = validate_code(
                 current_task.filepath,
                 generated_code,
-            ):
-                break
+            )
 
-        # ==================================
-        # FALLBACK CONTENT
-        # ==================================
+            if valid:
+                break
 
         if not generated_code.strip():
 
-            if current_task.filepath.endswith(".html"):
+            generated_code = (
+                f"/* Failed to generate "
+                f"{current_task.filepath} */"
+            )
 
-                generated_code = """
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Generated App</title>
-</head>
-<body>
-    <h1>Generated App</h1>
-</body>
-</html>
-"""
-
-            elif current_task.filepath.endswith(".css"):
-
-                generated_code = """
-body {
-    font-family: Arial;
-}
-"""
-
-            elif current_task.filepath.endswith(".js"):
-
-                generated_code = """
-console.log("Generated App");
-"""
-
-            else:
-
-                generated_code = "Generated file"
-
-        # ==================================
+        # ----------------------------
         # SAVE FILE
-        # ==================================
+        # ----------------------------
 
         write_file.invoke(
             {
@@ -365,9 +398,9 @@ console.log("Generated App");
             "status": f"ERROR: {str(e)}",
         }
 
-    # ======================================
+    # ----------------------------
     # NEXT STEP
-    # ======================================
+    # ----------------------------
 
     coder_state.current_step_idx += 1
 
@@ -410,10 +443,6 @@ graph.add_edge(
     "coder"
 )
 
-# ==========================================
-# LOOP
-# ==========================================
-
 graph.add_conditional_edges(
     "coder",
     lambda s: (
@@ -442,17 +471,15 @@ graph.set_entry_point(
 agent = graph.compile()
 
 # ==========================================
-# LOCAL TEST
+# TEST
 # ==========================================
 
 if __name__ == "__main__":
 
     result = agent.invoke(
         {
-            "user_prompt": (
-                "Build a colourful calculator "
-                "using html css and javascript"
-            )
+            "user_prompt":
+            "Build a modern calculator using html css and javascript"
         },
         {
             "recursion_limit": 20
