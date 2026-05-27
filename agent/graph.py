@@ -21,7 +21,7 @@ from agent.tools import (
 )
 
 # ==========================================
-# LOAD ENV
+# LOAD ENVIRONMENT
 # ==========================================
 
 load_dotenv()
@@ -46,16 +46,24 @@ llm = ChatGroq(
 # CLEAN MODEL OUTPUT
 # ==========================================
 
-def clean_code(content: str) -> str:
+def clean_code(content: str):
 
     if not content:
         return ""
 
-    # remove markdown fences
-    content = re.sub(r"```[a-zA-Z]*", "", content)
-    content = content.replace("```", "")
+    # Remove markdown fences
+    content = re.sub(
+        r"```[a-zA-Z]*",
+        "",
+        content
+    )
 
-    # remove fake filenames
+    content = content.replace(
+        "```",
+        ""
+    )
+
+    # Remove fake filenames
     bad_lines = [
         "File:",
         "Filename:",
@@ -91,9 +99,9 @@ def validate_code(filepath: str, content: str):
     if "```" in content:
         return False
 
-    # ----------------------------
+    # =====================================
     # HTML VALIDATION
-    # ----------------------------
+    # =====================================
 
     if filepath.endswith(".html"):
 
@@ -109,9 +117,9 @@ def validate_code(filepath: str, content: str):
             if item.lower() not in content.lower():
                 return False
 
-    # ----------------------------
+    # =====================================
     # CSS VALIDATION
-    # ----------------------------
+    # =====================================
 
     if filepath.endswith(".css"):
 
@@ -121,9 +129,9 @@ def validate_code(filepath: str, content: str):
         if "}" not in content:
             return False
 
-    # ----------------------------
+    # =====================================
     # JS VALIDATION
-    # ----------------------------
+    # =====================================
 
     if filepath.endswith(".js"):
 
@@ -133,8 +141,7 @@ def validate_code(filepath: str, content: str):
             ": void",
             "interface ",
             "type ",
-            "document.getElementById('user-input')",
-            "document.getElementById('calculate-button')",
+            "prompt(",
             "TODO",
             "lorem ipsum",
         ]
@@ -144,10 +151,25 @@ def validate_code(filepath: str, content: str):
             if pattern in content:
                 return False
 
+        # Prevent broken IDs
+        invalid_ids = [
+            "inputField",
+            "displayArea",
+            "addButton",
+            "subtractButton",
+            "multiplyButton",
+            "divideButton",
+        ]
+
+        for bad_id in invalid_ids:
+
+            if bad_id in content:
+                return False
+
     return True
 
 # ==========================================
-# PLANNER
+# PLANNER AGENT
 # ==========================================
 
 def planner_agent(state: dict):
@@ -159,7 +181,7 @@ def planner_agent(state: dict):
 
 IMPORTANT:
 
-For simple apps like:
+For simple frontend apps like:
 - calculator
 - todo app
 - portfolio
@@ -173,11 +195,11 @@ USE:
 
 DO NOT use:
 - react
-- typescript
 - node
 - express
+- typescript
 
-unless explicitly requested.
+unless user explicitly asks.
 """
 
     response = llm.with_structured_output(
@@ -186,12 +208,18 @@ unless explicitly requested.
         enhanced_prompt
     )
 
+    if response is None:
+
+        raise ValueError(
+            "Planner failed."
+        )
+
     return {
         "plan": response
     }
 
 # ==========================================
-# ARCHITECT
+# ARCHITECT AGENT
 # ==========================================
 
 def architect_agent(state: dict):
@@ -206,6 +234,12 @@ def architect_agent(state: dict):
         )
     )
 
+    if response is None:
+
+        raise ValueError(
+            "Architect failed."
+        )
+
     response.plan = plan
 
     return {
@@ -213,7 +247,7 @@ def architect_agent(state: dict):
     }
 
 # ==========================================
-# CODER
+# CODER AGENT
 # ==========================================
 
 def coder_agent(state: dict):
@@ -222,9 +256,9 @@ def coder_agent(state: dict):
         "coder_state"
     )
 
-    # ----------------------------
-    # INIT
-    # ----------------------------
+    # =====================================
+    # INITIALIZE STATE
+    # =====================================
 
     if coder_state is None:
 
@@ -239,9 +273,9 @@ def coder_agent(state: dict):
         .implementation_steps
     )
 
-    # ----------------------------
-    # DONE
-    # ----------------------------
+    # =====================================
+    # STOP CONDITION
+    # =====================================
 
     if coder_state.current_step_idx >= len(steps):
 
@@ -250,17 +284,17 @@ def coder_agent(state: dict):
             "status": "DONE",
         }
 
-    # ----------------------------
+    # =====================================
     # CURRENT TASK
-    # ----------------------------
+    # =====================================
 
     current_task = steps[
         coder_state.current_step_idx
     ]
 
-    # ----------------------------
-    # EXISTING CONTENT
-    # ----------------------------
+    # =====================================
+    # READ EXISTING FILE
+    # =====================================
 
     try:
 
@@ -274,9 +308,9 @@ def coder_agent(state: dict):
 
         existing_content = ""
 
-    # ----------------------------
-    # FILE TYPE RULES
-    # ----------------------------
+    # =====================================
+    # FILE RULES
+    # =====================================
 
     extra_rules = ""
 
@@ -290,8 +324,9 @@ JAVASCRIPT RULES:
   : string
   : number
   : void
-- NEVER use React syntax
+- NEVER use prompt()
 - MUST work directly in browser
+- Use EXACT IDs from HTML
 """
 
     elif current_task.filepath.endswith(".html"):
@@ -301,7 +336,7 @@ HTML RULES:
 - Generate valid HTML5
 - Link styles.css correctly
 - Link script.js correctly
-- Include visible UI
+- Include visible calculator UI
 """
 
     elif current_task.filepath.endswith(".css"):
@@ -309,22 +344,22 @@ HTML RULES:
         extra_rules = """
 CSS RULES:
 - Generate valid CSS
-- Add responsive styling
+- Add responsive modern styling
 """
 
-    # ----------------------------
+    # =====================================
     # PROMPT
-    # ----------------------------
+    # =====================================
 
     prompt = f"""
 You are an expert frontend engineer.
 
-Generate code for ONLY ONE FILE.
+Generate ONLY ONE FILE.
 
 PROJECT:
 {coder_state.task_plan.plan.model_dump_json()}
 
-TASK:
+CURRENT TASK:
 {current_task.task_description}
 
 TARGET FILE:
@@ -336,6 +371,7 @@ EXISTING CONTENT:
 {extra_rules}
 
 STRICT RULES:
+
 - Output ONLY raw code
 - No markdown
 - No explanations
@@ -343,13 +379,28 @@ STRICT RULES:
 - No fake filenames
 - No TODO comments
 - No placeholders
-- Generate FULL code
-- Ensure code is working
+
+CRITICAL:
+
+If generating JavaScript:
+- Use EXACT IDs/classes from HTML
+- NEVER invent element IDs
+- NEVER use prompt()
+- NEVER use TypeScript
+- MUST work directly in browser
+
+If generating HTML:
+- Include matching IDs used by JS
+
+If generating CSS:
+- Style existing HTML structure only
+
+Generate COMPLETE working code.
 """
 
-    # ----------------------------
-    # GENERATE
-    # ----------------------------
+    # =====================================
+    # GENERATE CODE
+    # =====================================
 
     try:
 
@@ -376,13 +427,13 @@ STRICT RULES:
         if not generated_code.strip():
 
             generated_code = (
-                f"/* Failed to generate "
+                f"/* Failed generating "
                 f"{current_task.filepath} */"
             )
 
-        # ----------------------------
+        # =================================
         # SAVE FILE
-        # ----------------------------
+        # =================================
 
         write_file.invoke(
             {
@@ -398,9 +449,9 @@ STRICT RULES:
             "status": f"ERROR: {str(e)}",
         }
 
-    # ----------------------------
+    # =====================================
     # NEXT STEP
-    # ----------------------------
+    # =====================================
 
     coder_state.current_step_idx += 1
 
@@ -457,7 +508,7 @@ graph.add_conditional_edges(
 )
 
 # ==========================================
-# ENTRY
+# ENTRY POINT
 # ==========================================
 
 graph.set_entry_point(
@@ -465,13 +516,13 @@ graph.set_entry_point(
 )
 
 # ==========================================
-# COMPILE
+# COMPILE GRAPH
 # ==========================================
 
 agent = graph.compile()
 
 # ==========================================
-# TEST
+# LOCAL TEST
 # ==========================================
 
 if __name__ == "__main__":
