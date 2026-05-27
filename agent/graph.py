@@ -3,15 +3,12 @@ from langchain.globals import set_verbose, set_debug
 from langchain_groq.chat_models import ChatGroq
 from langgraph.constants import END
 from langgraph.graph import StateGraph
-from langgraph.prebuilt import create_react_agent
 
 from agent.prompts import *
 from agent.states import *
 from agent.tools import (
     write_file,
     read_file,
-    get_current_directory,
-    list_files,
 )
 
 # =========================
@@ -20,7 +17,7 @@ from agent.tools import (
 
 load_dotenv()
 
-# Disable noisy logs in Streamlit
+# Disable noisy logs
 set_debug(False)
 set_verbose(False)
 
@@ -39,19 +36,21 @@ llm = ChatGroq(
 
 def planner_agent(state: dict) -> dict:
     """
-    Converts user prompt into structured Plan.
+    Converts user prompt into a structured project plan.
     """
 
     user_prompt = state["user_prompt"]
 
-    resp = llm.with_structured_output(Plan).invoke(
+    response = llm.with_structured_output(Plan).invoke(
         planner_prompt(user_prompt)
     )
 
-    if resp is None:
+    if response is None:
         raise ValueError("Planner failed to generate plan.")
 
-    return {"plan": resp}
+    return {
+        "plan": response
+    }
 
 
 # =========================
@@ -65,16 +64,20 @@ def architect_agent(state: dict) -> dict:
 
     plan: Plan = state["plan"]
 
-    resp = llm.with_structured_output(TaskPlan).invoke(
-        architect_prompt(plan=plan.model_dump_json())
+    response = llm.with_structured_output(TaskPlan).invoke(
+        architect_prompt(
+            plan=plan.model_dump_json()
+        )
     )
 
-    if resp is None:
+    if response is None:
         raise ValueError("Architect failed to generate task plan.")
 
-    resp.plan = plan
+    response.plan = plan
 
-    return {"task_plan": resp}
+    return {
+        "task_plan": response
+    }
 
 
 # =========================
@@ -83,11 +86,12 @@ def architect_agent(state: dict) -> dict:
 
 def coder_agent(state: dict) -> dict:
     """
-    Tool-using coding agent.
+    Generates code file-by-file.
     """
 
     coder_state: CoderState = state.get("coder_state")
 
+    # Initialize coder state
     if coder_state is None:
         coder_state = CoderState(
             task_plan=state["task_plan"],
@@ -96,7 +100,10 @@ def coder_agent(state: dict) -> dict:
 
     steps = coder_state.task_plan.implementation_steps
 
+    # =========================
     # Stop condition
+    # =========================
+
     if coder_state.current_step_idx >= len(steps):
         return {
             "coder_state": coder_state,
@@ -105,76 +112,74 @@ def coder_agent(state: dict) -> dict:
 
     current_task = steps[coder_state.current_step_idx]
 
-    # Read existing file safely
+    # =========================
+    # Read existing content
+    # =========================
+
     try:
         existing_content = read_file.invoke(
-            {"path": current_task.filepath}
+            {
+                "path": current_task.filepath
+            }
         )
     except Exception:
         existing_content = ""
 
-    # Strong anti-hallucination instruction
-    system_prompt = f"""
-You are a coding agent.
+    # =========================
+    # Prompt
+    # =========================
 
-You MUST ONLY use the following tools:
-- read_file
-- write_file
-- list_files
-- get_current_directory
+    prompt = f"""
+You are an expert software engineer.
 
-DO NOT invent tools.
-DO NOT call tools that are not provided.
+Generate COMPLETE production-ready code.
 
-Always use write_file to save code changes.
-"""
-
-    user_prompt = f"""
 Task:
 {current_task.task_description}
 
-File:
+File Path:
 {current_task.filepath}
 
 Existing Content:
 {existing_content}
 
-Implement the requested changes carefully.
+IMPORTANT RULES:
+- Return ONLY raw code
+- No markdown
+- No explanations
+- No code fences
+- Generate FULL file content
+- Preserve existing functionality if present
 """
 
-    coder_tools = [
-        read_file,
-        write_file,
-        list_files,
-        get_current_directory,
-    ]
-
-    react_agent = create_react_agent(
-        llm,
-        tools=coder_tools,
-    )
+    # =========================
+    # Generate code
+    # =========================
 
     try:
-        react_agent.invoke(
+
+        response = llm.invoke(prompt)
+
+        generated_code = response.content.strip()
+
+        # Save file
+        write_file.invoke(
             {
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": system_prompt,
-                    },
-                    {
-                        "role": "user",
-                        "content": user_prompt,
-                    },
-                ]
+                "path": current_task.filepath,
+                "content": generated_code,
             }
         )
 
     except Exception as e:
+
         return {
             "coder_state": coder_state,
             "status": f"ERROR: {str(e)}",
         }
+
+    # =========================
+    # Move to next step
+    # =========================
 
     coder_state.current_step_idx += 1
 
@@ -184,7 +189,7 @@ Implement the requested changes carefully.
 
 
 # =========================
-# Graph
+# Build Graph
 # =========================
 
 graph = StateGraph(dict)
@@ -193,24 +198,32 @@ graph.add_node("planner", planner_agent)
 graph.add_node("architect", architect_agent)
 graph.add_node("coder", coder_agent)
 
+# Flow
 graph.add_edge("planner", "architect")
 graph.add_edge("architect", "coder")
 
+# Loop coder until done
 graph.add_conditional_edges(
     "coder",
-    lambda s: "END" if s.get("status") == "DONE" else "coder",
+    lambda s: (
+        "END"
+        if s.get("status") == "DONE"
+        else "coder"
+    ),
     {
         "END": END,
         "coder": "coder",
     },
 )
 
+# Entry point
 graph.set_entry_point("planner")
 
+# Compile graph
 agent = graph.compile()
 
 # =========================
-# Local testing
+# Local Testing
 # =========================
 
 if __name__ == "__main__":
@@ -223,7 +236,7 @@ if __name__ == "__main__":
             )
         },
         {
-            "recursion_limit": 100
+            "recursion_limit": 20
         }
     )
 
